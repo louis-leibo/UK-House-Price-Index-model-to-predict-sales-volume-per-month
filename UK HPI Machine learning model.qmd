@@ -1,0 +1,359 @@
+---
+title: "UK HPI - model to predict the sales volume per month in the UK"
+author: "Louis Leibovici"
+output: html
+self-contained: true
+---
+
+Objective: to use applied computer programming to modify data and fit and apply linear regression models for making predictions
+
+# Setup
+
+Import required libraries:
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(readr)
+library(lubridate)
+library(tidymodels)
+library(ggplot2)
+library(modelsummary) 
+```
+
+I read the data set.
+
+```{r read, message=FALSE, warning=FALSE}
+filepath <- "data/UK-HPI-full-file-2023-06.csv"
+uk_hpi <- read_csv(filepath)
+```
+
+Creation of a data frame that contains only United Kingdom's data and of a df_uk_train to contain just the data for the UK up until December 2019, and a df_uk_test to contain the data for the UK from January 2020 onwards.
+
+```{r}
+selected_cols <- c("Date", "RegionName", "SalesVolume")
+
+df_uk <-
+    uk_hpi %>%
+    filter(RegionName == "United Kingdom") %>%
+    select(all_of(selected_cols)) %>%
+    rename(date = Date, region = RegionName, sales_volume = SalesVolume) %>%
+    mutate(date = dmy(date)) # to make sure that date is a date object
+
+df_uk_train <- 
+    df_uk %>% 
+    filter(date <= ymd("2019-12-31"))
+
+df_uk_test <- 
+    df_uk %>% 
+    filter(date >= ymd("2020-01-01"))
+```
+
+# Creation of a linear model
+
+I am now going to create a linear model using tidymodels that can predict the variable SalesVolume per month, using just the df_uk_train data as a starting point. 
+
+## For df_uk_train :
+
+**Pre-processing:** To create a linear model, I am using tidymodels. However, firstly, I would like to further preprocess df_uk_train by dropping the rows with NA values.
+
+```{r}
+df_uk_train <-
+    df_uk_train %>%
+    drop_na(sales_volume)
+```
+
+**Creation of multiple lagged variables: using 'recipe':** I am using the 'recipe' function to create multiple lagged variables to our dependent variable, sales_volume, in order to have the best estimation of our dependent variable. (cf question 7 for test of another method and comparisons).
+
+```{r}
+my_recip <- 
+    recipe(sales_volume ~ ., data = df_uk_train) %>%  
+    step_arrange(date) %>% # I sort the data by date before using step_lag()
+    step_lag(sales_volume, lag=1:12) %>%
+    update_role(date, region, new_role = "id") %>% #`Date` and `RegionName` have the role of a 'predictor', but I want to use them as 'identifiers' for that row
+    step_naomit(all_predictors(), skip=FALSE) %>% # I remove any rows with missing values
+    prep() 
+```
+
+I check that only lagged variables are identified as predictors and that the other two columns are now identified as 'id' variables.
+
+```{r}
+my_recip %>%
+  summary() %>%
+  knitr::kable()
+```
+
+Then, I use the `bake()` function to apply the recipe to the data frame.
+
+```{r bake, message=FALSE, warning=FALSE}
+my_recip %>% 
+    bake(df_uk_train) %>% 
+    arrange(date)
+```
+
+**Workflow:** I now need a workflow to which I can attach the recipe and the model. I therefore create a workflow of a linear regression.
+
+```{r}
+lm_model <- 
+    linear_reg() %>%
+    set_engine("lm")
+
+wflow <- 
+    workflow() %>% 
+    add_recipe(my_recip) %>% 
+    add_model(lm_model)
+```
+
+Then, I can fit the workflow to the data:
+
+```{r}
+model1 <- 
+    wflow %>% 
+    fit(data = df_uk_train)
+
+msummary(model1)
+
+model1 %>% 
+  glance() %>%
+  knitr::kable()
+```
+
+## For df_uk_test :
+
+**Pre-processing:** To create a linear model, I am using tidymodels. However, firstly, I would like to further preprocess df_uk_test by dropping the rows with NA values.
+
+```{r}
+df_uk_test <-
+    df_uk_test %>%
+    drop_na(sales_volume)
+```
+
+**Apply the recipe:**
+I use the `bake()` function to apply the recipe I created to the uk_test data frame.
+
+```{r bake2, message=FALSE, warning=FALSE}
+my_recip %>% 
+    bake(df_uk_test) %>% 
+    arrange(date)
+```
+
+**Fit the workflow to the data:** 
+Then, I can fit the workflow to the data:
+
+```{r}
+model2 <- 
+    wflow %>% 
+    fit(data = df_uk_test)
+
+msummary(model2)
+
+model2 %>% 
+  glance() %>%
+  knitr::kable()
+```
+
+I do not use use the future to make predictions. That is, each line of the dataset I pass to the model must contain: the target variable (SalesVolume) plus the predictors I am using to train and these predictors cannot refer to the same (or future) month(s) of the target variable.
+
+For example, in the line relative to January 2018, I can use data from December 2017 and before (not just the previous month) but I cannot use any data from January 2018 onwards.
+
+It is what I have done. Indeed, the predictors I am using are 12 lagged variables,which are variables from the past. Ultimately, this concern is removed. Because also I made sure that my data was sorted by date, the lagged variable referred to values in the past.
+
+# How well my model fits the data
+
+I show that my model fits the data well, by plotting residuals and by calculating the MAE of your model on the data relative to df_uk_train. 
+
+**Augmenting the data:** Now, I extract the fitted model and `augument()` the data with predictions:
+
+```{r}
+fitted_model1 <- model1 %>% extract_fit_parsnip()
+
+# To make predictions, I do not use original data
+# Instead, I apply the same pre-processing steps (i.e. bake the recipe)
+df_uk_train_baked <- my_recip %>% bake(df_uk_train)
+
+plot_df_uk_train_bake_fitted <- fitted_model1 %>% augment(new_data = df_uk_train_baked) 
+```
+
+**Plotting:** Then, I use the resulting data frame to plot using `ggplot2` the residuals against the fitted values.
+
+```{r}
+g1 <- ggplot(plot_df_uk_train_bake_fitted, aes(x = .pred, y = .resid)) +
+    geom_point(alpha=0.2, size=3, color="red", stroke=1) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(x = "Fitted values", y = "Residuals", title="Model1 : df_uk_train: Residuals vs Fitted") + 
+    theme_bw() + 
+    theme(axis.title.x = element_text(size = rel(1.2)), 
+          axis.text.x = element_text(size = rel(1.2)),
+          axis.title.y = element_text(size = rel(1.2)),
+          axis.text.y = element_text(size = rel(1.2)),
+          plot.title = element_text(size = rel(1.5), face = "bold"))
+g1
+```
+
+**MAE:** Now, I calculate the Mean Absolute Error (MAE), which is, on average, how far off is the model from the actual data.
+
+```{r}
+mae_df_uk_train <- 
+    plot_df_uk_train_bake_fitted %>% 
+    mae(truth = sales_volume, estimate = .pred)
+
+mae_df_uk_train %>%
+  knitr::kable()
+```
+
+**How 'well' does it fit?** 
+I can see that the data fits well to the estimates. Indeed, given the scale of this graph, I can see that the residuals bounce around the 0 line and are around the 0 line, suggesting that the relationship is indeed linear and that the variances of the error terms are equal. Finally, there are no strong outliers, as there is no residual standing out too far from the 0 line.
+
+In addition, I am looking at the mean, median, min and max values of my predictions (.pred column) and of the real sales_volume values. 
+```{r}
+plot_df_uk_train_bake_fitted %>% 
+  summary() %>%
+  knitr::kable()
+```
+
+We can see that the medians of the predictions (.pred) column and of the sales_volume column are almost the same, as well as the maximum values. The minimum values are not as close as the maximum values, but remain not very far. I would therefore say that the model fits well the data. 
+
+
+# How well my model predicts the future? 
+
+I show that my model can predict the future well, by calculating the residuals and the MAE of your model on the data relative to df_uk_test.
+
+**Augmenting the data:** Now, I extract the fitted model and `augment()` the data with predictions:
+
+```{r}
+fitted_model2 <- model2 %>% extract_fit_parsnip()
+
+# To make predictions, I do not use original data
+# Instead, I apply the same pre-processing steps (i.e. bake the recipe)
+df_uk_test_baked <- my_recip %>% bake(df_uk_test)
+
+plot_df_uk_test_bake_fitted <- fitted_model2 %>% augment(new_data = df_uk_test_baked) 
+```
+
+**Plotting:** Then, I use the resulting data frame to plot using `ggplot2` the residuals against the fitted values.
+
+```{r}
+g2 <- ggplot(plot_df_uk_test_bake_fitted, aes(x = .pred, y = .resid)) +
+    geom_point(alpha=0.2, size=3, color="red", stroke=1) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(x = "Fitted values", y = "Residuals", title="Model2 : df_uk_test: Residuals vs Fitted") + 
+    theme_bw() + 
+    theme(axis.title.x = element_text(size = rel(1.2)), 
+          axis.text.x = element_text(size = rel(1.2)),
+          axis.title.y = element_text(size = rel(1.2)),
+          axis.text.y = element_text(size = rel(1.2)),
+          plot.title = element_text(size = rel(1.5), face = "bold"))
+g2
+```
+
+**MAE:** Now, I calculate the Mean Absolute Error (MAE), which is, on average, how far off is the model from the actual data.
+
+```{r}
+mae_df_uk_test <- 
+    plot_df_uk_test_bake_fitted %>% 
+    mae(truth = sales_volume, estimate = .pred)
+
+mae_df_uk_test %>%
+  knitr::kable()
+```
+
+**How 'well' it fits the data:**
+In addition to the plot depicting the residuals against the fitted values, I am looking at the mean, median, min and max values of my predictions and of the real sales_volume values. 
+```{r}
+plot_df_uk_test_bake_fitted %>% 
+  summary() %>%
+  knitr::kable()
+```
+
+We can see that the medians of the predictions (.pred) column and of the sales_volume column are roughly the same, as well as the minimum values. The maximum values are not as close as the maximum values, but remain not very far. I would therefore say that the model fits well the data. 
+
+In addition, looking at the plot, we can see that the majority of the dots are very close to the 0 line. There are a few outliers, but they are not drastically far from the 0 line. Once again, the model fits well the data. 
+
+# Exxplanation of my choices
+
+Why I you choose the variables I did? How did I come up with this particular configuration? Did I try anything else that didn't work? 
+
+**Choice of variables and configuration:** I have chosen multiple lagged variables to estimate as best as possible sales volume with past data. I have chosen 12 lagged variables to have a better estimate than what I would have had with only one lagged variable. Following W04 Lab, I have decided to choose the 'recipe' function we learnt during this lab to make predictions on both data frames: df_uk_train and df_uk_est. 
+
+**With only one lagged variable:** Initially, prior to W04 Lab, I created only one lagged variable to estimate sales volume. I believe that it is interesting to compare the outcomes of both configurations and check whether the model with multiple lagged variables is indeed precise.
+
+Here is the configuration with only one lagged variable:
+
+1/ Firstly, I am adding 1 lagged variable to our dependent variable, sales_volume.
+
+For df_uk_train :
+
+```{r}
+df_uk_train_1_lag <- 
+    df_uk_train %>%
+    arrange(date) %>% # Sort in ascending order so we can use lag 
+    mutate(sales_volume_lag1 = lag(sales_volume, 1)) %>%
+    drop_na() %>%
+    arrange(desc(date)) # sort by date in descending order just to make it easier to read
+```
+
+For df_uk_test :
+
+```{r}
+df_uk_test_1_lag <- 
+    df_uk_test %>%
+    arrange(date) %>% # Sort in ascending order so we can use lag 
+    mutate(sales_volume_lag1 = lag(sales_volume, 1)) %>%
+    drop_na() %>%
+    arrange(desc(date)) # sort by date in descending order just to make it easier to read
+```
+
+2/ Run the linear regression model
+
+We can now run the linear regression model with `sales_volume` as the dependent variable and `sales_volume_lag1` as the independent variable. We save the model as `model1_1_lag` for df_uk_test and as `model2_1_lag` for df_uk_train.
+
+```{r}
+model1_1_lag <-
+    linear_reg() %>%
+    set_engine("lm") %>%
+    fit(sales_volume ~ sales_volume_lag1, data = df_uk_test_1_lag)
+```
+
+```{r}
+model2_1_lag <-
+    linear_reg() %>%
+    set_engine("lm") %>%
+    fit(sales_volume ~ sales_volume_lag1, data = df_uk_train_1_lag)
+```
+
+3/ I can now print the model coefficients in a tidy way and see the overall statistics:
+
+```{r}
+model1_1_lag %>% 
+  tidy() %>%
+  knitr::kable()
+
+model1_1_lag %>% 
+  glance() %>%
+  knitr::kable()
+```
+
+```{r}
+model2_1_lag %>% 
+  tidy() %>%
+  knitr::kable()
+
+model2_1_lag %>% 
+  glance() %>%
+  knitr::kable()
+```
+
+**Comparisons** 
+I am first going to use the R-squared to see how well the data fit the regression models. R-squared is a measure that depicts the proportion of variance in the dependent variable that can be explained by the independent variable. The closer to 1 the R-squared is, the better the data fit the regression models (usually). 
+
+For the df_uk_train data frame, which contains just the data for the UK up until December 2019:
+- in the model with 12 lagged variables used to estimate sales volume, the R-squared is: 0.76443
+- in the model with 1 lagged variable used to estimate sales volume, the R-squared is: 0.0987334
+
+For the df_uk_test data frame, which contains the data for the UK from January 2020 onwards:
+- in the model with 12 lagged variables used to estimate sales volume, the R-squared is: 0.6617575 
+- in the model with 1 lagged variable used to estimate sales volume, the R-squared is: 0.7028153
+
+Ultimately, we can see that using 12 lagged variables for the data frame containing the data until December 2019 is significantly more precise than using 1 lagged variable. This is not surprising, as the data frame contains data from 2005 to 2019, which is a period of time long enough to see the impact of using multiple predictors to estimate sales volume per month. 
+
+Nevertheless, the R-squared of the model with 12 lagged variables is roughly the same as the R-squared of the model with only 1 lagged variable. I think that this can be explained by the fact that the period of time of the data set is not long enough to see the impact of using 12 predictors instead of 1. 
+
